@@ -1,5 +1,12 @@
 # NInfer-3090
 
+> **Fork provenance:** This repository is a fork of
+> [Don-Chad/ninfer-3090](https://github.com/Don-Chad/ninfer-3090) (RTX 3090 / `sm_86` port),
+> which is itself derived from [Neroued/ninfer](https://github.com/Neroued/ninfer)
+> (upstream, RTX 5090 / `sm_120a`). This fork adds an RTX 3080 port: runtime SM-count-aware GDN
+> gating routes and NVFP4 `linear_swiglu` A16 prefill support. See
+> [docs/rtx-3080-benchmark.md](docs/rtx-3080-benchmark.md) for the port, fixes, and measurements.
+
 NInfer-3090 is a specialized C++20/CUDA inference engine for **Qwen3.8-27B** and Qwen3.6 on one
 24 GB NVIDIA GeForce RTX 3090. Qwen3.8-27B is a first-class, tested target: the native SM86
 runtime loads its official groupwise `.ninfer` artifact, serves OpenAI- and Anthropic-compatible
@@ -296,9 +303,13 @@ A real-artifact Linux generation and Linux performance qualification remain open
 
 ## Upstream
 
-NInfer-3090 is derived from [Neroued/ninfer](https://github.com/Neroued/ninfer). The upstream project
-targets RTX 5090/`sm_120a`; this fork carries the Windows and Linux SM86 compatibility layer,
-compact 35B artifact support, and RTX 3090-specific schedules and memory planning.
+This fork traces to [Neroued/ninfer](https://github.com/Neroued/ninfer) through
+[Don-Chad/ninfer-3090](https://github.com/Don-Chad/ninfer-3090). The upstream
+[Neroued/ninfer](https://github.com/Neroued/ninfer) project targets RTX 5090/`sm_120a`; the
+[Don-Chad/ninfer-3090](https://github.com/Don-Chad/ninfer-3090) fork carries the Windows and Linux
+SM86 compatibility layer, compact 35B artifact support, and RTX 3090-specific schedules and memory
+planning. This repository ([yangkang5303/ninfer-3090](https://github.com/yangkang5303/ninfer-3090))
+adds RTX 3080 support on top of that.
 
 ## Contributors
 
