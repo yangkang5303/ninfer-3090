@@ -28,29 +28,70 @@ struct RouteSpec {
     Bf16GdnGatingScheduleId schedule;
 };
 
-constexpr std::array<RouteSpec, 6> k27Routes{{
-    {{1, 1}, Bf16GdnGatingScheduleId::GemvPairedRows},
-    {{2, 8}, Bf16GdnGatingScheduleId::SmallTSplit10},
+// Fewest SMs of any device this build supports. The RTX 3090 is the smallest sm_86 part the fork
+// originally targeted, so the compile-time catalog guard is checked against it as a lower bound: a
+// route that fits on 82 SMs fits on every supported device. Overshooting the real budget is not
+// merely slow -- the driver rejects the launch with cudaErrorCooperativeLaunchTooLarge -- so the
+// compile-time tables and the runtime tables built for the active device must stay at or below
+// this floor.
+inline constexpr std::int32_t kMinSupportedSmCount = 82;
+
+// Direction of a cooperative MMA route: the grid is ceil(cols / tile_cols) * row_tiles * SplitK
+// CTAs and every CTA of the grid must be simultaneously resident, so the largest admissible column
+// count is budget / (row_tiles * SplitK) * tile_cols where budget is the per-SM residency times
+// the device's SM count. The ceiling is therefore a function of the runtime SM count: the compile
+// time catalog below binds the floor at kMinSupportedSmCount, and the runtime route tables rebuild
+// the same closed partition for the active device so a smaller SM86 part (e.g. an RTX 3080 with
+// 68 SMs) still resolves legal, jointly resident cooperative routes.
+constexpr std::int32_t cooperative_ceiling(std::int32_t ctas_per_sm, std::int32_t row_tiles,
+                                           std::int32_t tile_cols, std::int32_t split_k,
+                                           std::int32_t sms) noexcept {
+    const std::int64_t budget = static_cast<std::int64_t>(ctas_per_sm) * sms;
+    return static_cast<std::int32_t>(budget / (row_tiles * static_cast<std::int64_t>(split_k)) *
+                                     tile_cols);
+}
+
+constexpr std::array<RouteSpec, 6> build_27_routes(std::int32_t sms) noexcept {
     // sm_86 has 64 Ki registers and 100 KiB of shared memory per SM. Every MMA route runs
     // 8 warps at 65 registers, so 8*32*72 = 18,432 registers admits three CTAs/SM while the 40 KiB
-    // of dynamic shared memory admits two. Shared memory binds: 2 CTAs/SM -> 164 device-wide.
-    // Grid is ceil(T/128)*3*SplitK, so the legal ends are 768 / 1664 / 3456.
-    {{9, 768}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
-    {{769, 1664}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
-    {{1665, 3456}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
-    {{3457, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
-}};
+    // of dynamic shared memory admits two. Shared memory binds: 2 CTAs/SM. Grid is
+    // ceil(T/128)*3*SplitK, so at the 82-SM floor (2*82 = 164 device-wide) the legal ends are
+    // 768 / 1664 / 3456 (ceil(T/128) = floor(164/24) / floor(164/12) / floor(164/6)).
+    const std::int32_t split8_last = cooperative_ceiling(2, 3, 128, 8, sms);
+    const std::int32_t split4_last = cooperative_ceiling(2, 3, 128, 4, sms);
+    const std::int32_t split2_last = cooperative_ceiling(2, 3, 128, 2, sms);
+    return {{
+        {{1, 1}, Bf16GdnGatingScheduleId::GemvPairedRows},
+        {{2, 8}, Bf16GdnGatingScheduleId::SmallTSplit10},
+        {{9, split8_last}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
+        {{split8_last + 1, split4_last}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
+        {{split4_last + 1, split2_last}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
+        {{split2_last + 1, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
+    }};
+}
 
-constexpr std::array<RouteSpec, 5> k35Routes{{
+constexpr std::array<RouteSpec, 6> k27Routes = build_27_routes(kMinSupportedSmCount);
+
+constexpr std::array<RouteSpec, 5> build_35_routes(std::int32_t sms) noexcept {
     // Same progression, clamped to the sm_86 residency ceilings. Grid is ceil(T/64)*2*SplitK, so
-    // with 328 CTAs for split16 and 246 for split8/4/2 the legal ends are 640 / 960 / 1920 / 3904.
-    // The upstream bounds (1024 / 2048 / 4096) each land on 256 CTAs and exceed the 246 limit.
-    {{1, 127}, Bf16GdnGatingScheduleId::MmaCooperativeSplit16},
-    {{128, 960}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
-    {{961, 1920}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
-    {{1921, 3904}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
-    {{3905, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
-}};
+    // at the 82-SM floor split8/4/2 run at 3 CTAs/SM (246 device-wide) and split16 at 4 CTAs/SM
+    // (328), giving split8/4/2 legal ends of 960 / 1920 / 3904 (floor(246/16) / floor(246/8) /
+    // floor(246/4)). The split16 handoff band is fixed small-token territory: its grid
+    // (<= 2*2*16 = 64 CTAs) is resident on any device that admits the target. The upstream bounds
+    // (1024 / 2048 / 4096) each land on 256 CTAs and exceed even the 246 floor limit.
+    const std::int32_t split8_last = cooperative_ceiling(3, 2, 64, 8, sms);
+    const std::int32_t split4_last = cooperative_ceiling(3, 2, 64, 4, sms);
+    const std::int32_t split2_last = cooperative_ceiling(3, 2, 64, 2, sms);
+    return {{
+        {{1, 127}, Bf16GdnGatingScheduleId::MmaCooperativeSplit16},
+        {{128, split8_last}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
+        {{split8_last + 1, split4_last}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
+        {{split4_last + 1, split2_last}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
+        {{split2_last + 1, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
+    }};
+}
+
+constexpr std::array<RouteSpec, 5> k35Routes = build_35_routes(kMinSupportedSmCount);
 
 template <std::size_t N>
 constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes,
@@ -87,12 +128,6 @@ constexpr std::int32_t ctas_per_sm_35(Bf16GdnGatingScheduleId schedule) noexcept
     if (schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit16) { return 4; }
     return 3;
 }
-
-// Fewest SMs of any device this build supports. The RTX 3090 is the smallest sm_86 part the fork
-// targets, so the compile-time catalog guard is checked against it: a route that fits on 82 SMs
-// fits on every supported device. Overshooting the real budget is not merely slow -- the driver
-// rejects the launch with cudaErrorCooperativeLaunchTooLarge -- so this must stay a lower bound.
-inline constexpr std::int32_t kMinSupportedSmCount = 82;
 
 // Cached SM count of the active device. cudaDeviceGetAttribute is cheap but this sits on the
 // per-request planning path, so read it once. Falling back to the documented minimum keeps the
@@ -461,13 +496,13 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& probl
             "BF16 GDN gating: exact problem or column count is not admitted");
     }
     if (is_27(problem)) {
-        for (const RouteSpec& route : k27Routes) {
+        for (const RouteSpec& route : build_27_routes(device_sm_count())) {
             if (route.cols.contains(problem.cols)) {
                 return bf16_gdn_gating_resolve_candidate(route.schedule, problem);
             }
         }
     } else {
-        for (const RouteSpec& route : k35Routes) {
+        for (const RouteSpec& route : build_35_routes(device_sm_count())) {
             if (route.cols.contains(problem.cols)) {
                 return bf16_gdn_gating_resolve_candidate(route.schedule, problem);
             }
@@ -484,8 +519,9 @@ std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t heads, std::in
     const Bf16GdnGatingProblem base{heads, input_rows, 1};
     (void)bf16_gdn_gating_resolve_plan({heads, input_rows, min_cols});
     (void)bf16_gdn_gating_resolve_plan({heads, input_rows, max_cols});
-    return is_27(base) ? route_capacity(k27Routes, base, min_cols, max_cols)
-                       : route_capacity(k35Routes, base, min_cols, max_cols);
+    return is_27(base)
+               ? route_capacity(build_27_routes(device_sm_count()), base, min_cols, max_cols)
+               : route_capacity(build_35_routes(device_sm_count()), base, min_cols, max_cols);
 }
 
 Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProblem& problem) {

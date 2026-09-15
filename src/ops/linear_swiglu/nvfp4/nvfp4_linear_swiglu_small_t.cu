@@ -76,12 +76,18 @@ using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
 template <int ActiveTokens>
 void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    // Mirrors the registered linear small-T production schedules (kNvfp4FirstSmallT..kLastSmallT):
+    // the same 8/4/16-warp occupancy crossovers and 8 values-per-lane register band at 17..20.
     static constexpr auto kActivationAccess = ActiveTokens <= 4
                                                   ? Nvfp4SmallTActivationAccess::SharedPhase
                                                   : Nvfp4SmallTActivationAccess::TokenPacked;
-    static constexpr int kWarpsPerCta       = ActiveTokens >= 13 ? 16 : (ActiveTokens >= 5 ? 4 : 8);
-    using Schedule = Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, 16, ActiveTokens, 1, kActivationAccess,
-                                         Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
+    static constexpr int kValuesPerLane =
+        ActiveTokens >= 17 && ActiveTokens <= 20 ? 8 : 16;
+    static constexpr int kWarpsPerCta =
+        ActiveTokens >= 17 ? 4 : (ActiveTokens >= 13 ? 16 : (ActiveTokens >= 5 ? 4 : 8));
+    using Schedule = Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, kValuesPerLane, ActiveTokens, 1,
+                                         kActivationAccess, Nvfp4ScaleAccess::Direct,
+                                         Nvfp4CodeCache::Default, 1,
                                          Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
     static_assert((kIntermediate % Schedule::kWarpsPerCta) == 0);
     constexpr int kBlocks = kIntermediate / Schedule::kWarpsPerCta;
@@ -101,7 +107,8 @@ constexpr auto make_launchers(std::index_sequence<Offsets...>) {
         &launch_exact<kNvfp4FirstSmallT + static_cast<int>(Offsets)>...};
 }
 
-constexpr auto kLaunchers = make_launchers(std::make_index_sequence<16 - kNvfp4FirstSmallT + 1>{});
+constexpr auto kLaunchers =
+    make_launchers(std::make_index_sequence<kNvfp4LastSmallT - kNvfp4FirstSmallT + 1>{});
 
 } // namespace
 

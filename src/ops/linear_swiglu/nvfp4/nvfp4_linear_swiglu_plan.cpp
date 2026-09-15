@@ -23,17 +23,35 @@ enum class Nvfp4LinearSwiGluRoute {
 
 constexpr std::int32_t kPrimaryT = 1024;
 
+// The fused A16 kernels are registered for exactly kNvfp4FirstSmallT..kNvfp4LastSmallT tokens
+// and the decode kernel for one. Longer token runs are handled by striding the same kernels over
+// the token axis, mirroring the FP8 A16 linear_swiglu route. This keeps the A16 policy valid for
+// arbitrary prefill widths on sm_86, where the W4A4/TMA routes are unavailable.
+void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    constexpr std::int32_t kChunk = kNvfp4LastSmallT;
+    for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kChunk) {
+        const std::int32_t active = std::min(kChunk, x.ne[1] - token_begin);
+        auto* input = static_cast<std::uint8_t*>(x.data) +
+                      static_cast<std::int64_t>(token_begin) * weight.k * sizeof(std::uint16_t);
+        auto* output = static_cast<std::uint8_t*>(out.data) +
+                       static_cast<std::int64_t>(token_begin) * out.ne[0] * sizeof(std::uint16_t);
+        const Tensor input_chunk(input, DType::BF16, {weight.k, active});
+        Tensor output_chunk(output, DType::BF16, {out.ne[0], active});
+        if (active == 1) {
+            nvfp4_linear_swiglu_decode_launch(input_chunk, weight, output_chunk, stream);
+        } else {
+            nvfp4_linear_swiglu_small_t_launch(input_chunk, weight, output_chunk, stream);
+        }
+    }
+}
+
 Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 linear_swiglu: T must be positive"); }
     if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
         throw std::invalid_argument("nvfp4 linear_swiglu admits only A16 or A4");
     }
-    if (policy == LinearPolicy::A16Only) {
-        if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
-        if (tokens <= 16) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
-        throw std::invalid_argument("nvfp4 linear_swiglu A16 is registered only through T=16");
-    }
     if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
+    if (policy == LinearPolicy::A16Only) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
     if (tokens <= 4) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
     if (tokens <= 48) { return Nvfp4LinearSwiGluRoute::FusedW4A4; }
     if (tokens == kPrimaryT) { return Nvfp4LinearSwiGluRoute::TmaFusedW4A4; }
@@ -112,7 +130,7 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
         nvfp4_linear_swiglu_decode_launch(x, weight, out, stream);
         return;
     case Nvfp4LinearSwiGluRoute::SmallTFusedA16:
-        nvfp4_linear_swiglu_small_t_launch(x, weight, out, stream);
+        launch_a16(x, weight, out, stream);
         return;
     case Nvfp4LinearSwiGluRoute::FusedW4A4:
         nvfp4_linear_swiglu_w4a4_launch(x, weight, out, workspace, stream);
